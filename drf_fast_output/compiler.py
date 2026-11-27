@@ -646,6 +646,9 @@ _SIMPLE_ATTRS = ("_fast_output_simple_unbound", "_fast_output_simple_bound")
 
 
 def _is_mapping(cls: type) -> bool:
+    # Builtins cannot hold our class cache; avoid a failed write per dict lookup.
+    if cls is dict:
+        return True
     # Stored as (cls, answer): a plain class attribute read, which hits the type
     # attribute cache, and one inherited from a base is recognised as such.
     hit = getattr(cls, _IS_MAPPING_ATTR, None)

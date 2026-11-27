@@ -18,6 +18,7 @@ import django
 django.setup()
 
 from django.core.management import call_command  # noqa: E402
+from rest_framework import serializers  # noqa: E402
 
 from drf_fast_output import fast_output  # noqa: E402
 from tests.testapp.models import Author, Book, Chapter, Profile, Tag  # noqa: E402
@@ -65,11 +66,21 @@ rich = list(
 plain = list(Book.objects.select_related("author__profile").prefetch_related("tags"))
 
 
+class DictBookSerializer(serializers.Serializer):
+    title = serializers.CharField()
+    pages = serializers.IntegerField()
+    weight = serializers.FloatField()
+
+
+dict_rows = [{"title": b.title, "pages": b.pages, "weight": b.weight} for b in books]
+
+
 # (label, plain DRF serializer, fast equivalent, rows)
 CASES = [
     ("ModelSerializer, fields='__all__'", BookAllStockSerializer, BookAllSerializer, flat),
     ("Nested (FK, O2O, reverse FK, M2M, methods)", BookRichStockSerializer, BookRichSerializer, rich),
     ("fast_output(stock serializer)", PlainBookSerializer, fast_output(PlainBookSerializer), plain),
+    ("Dictionary rows", DictBookSerializer, fast_output(DictBookSerializer), dict_rows),
 ]
 
 
