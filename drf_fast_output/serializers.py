@@ -11,7 +11,7 @@ from django.db.models.manager import BaseManager
 from rest_framework import serializers as s
 
 from . import compiler, conf
-from .compiler import DT_OTHER, datetime_mode, force_drf, passthrough, stock_drf
+from .compiler import active_dtm, datetime_mode, force_drf, passthrough, stock_drf
 
 __all__ = [
     "FastListSerializer",
@@ -102,7 +102,16 @@ class FastOutputMixin:
         row = None if force_drf.get() or not compiler.enabled() else self._fast_output_row
         if row is None:
             return super().to_representation(instance)  # type: ignore[misc]
-        out = row(instance, datetime_mode() if row.needs_dtm else DT_OTHER)
+        dtm = active_dtm.get()
+        if dtm is not None:
+            out = row(instance, dtm)
+        else:  # the outermost fast call: decide it once for everything below
+            dtm = datetime_mode()
+            token = active_dtm.set(dtm)
+            try:
+                out = row(instance, dtm)
+            finally:
+                active_dtm.reset(token)
         if conf.get("VERIFY"):
             _verify(
                 out,
@@ -137,7 +146,20 @@ class FastListSerializer(s.ListSerializer):
 
     @passthrough
     def to_representation(self, data: Any) -> list:
-        if force_drf.get() or not compiler.enabled() or not self._fast_output_ok:
+        if force_drf.get() or not compiler.enabled():
+            return super().to_representation(data)
+        if active_dtm.get() is not None:
+            return self._fast_representation(data)
+        # The outermost fast call: one datetime mode for every row, even when
+        # the child isn't inlineable and DRF's loop calls it row by row.
+        token = active_dtm.set(datetime_mode())
+        try:
+            return self._fast_representation(data)
+        finally:
+            active_dtm.reset(token)
+
+    def _fast_representation(self, data: Any) -> list:
+        if not self._fast_output_ok:
             return super().to_representation(data)
         it = iter(data.all() if isinstance(data, BaseManager) else data)
         first = next(it, _EMPTY)
@@ -145,7 +167,7 @@ class FastListSerializer(s.ListSerializer):
             return []  # like DRF, without building the child's fields
         child: Any = self.child
         row = compiler.get_row(child)  # compiled on the first row, then cached on the child
-        dtm = datetime_mode() if row.needs_dtm else DT_OTHER
+        dtm = datetime_mode()
         items = itertools.chain((first,), it)
         if not conf.get("VERIFY"):
             return [row(o, dtm) for o in items]

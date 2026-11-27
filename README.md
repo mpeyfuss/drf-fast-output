@@ -97,7 +97,9 @@ Each readable field gets an **access** strategy and a **conversion**:
 | `prefetch` | to-many relations: reads Django's prefetch cache when populated  |
 | `call`     | model method sources such as `get_FOO_display`                   |
 | `method`   | `SerializerMethodField`                                          |
-| `get`      | everything else: DRF's own `field.get_attribute()`               |
+| `self`     | `source="*"`: the instance itself                                |
+| `path`     | dotted sources (`author.profile.bio`), properties, annotations, dict keys, and every field of a plain `Serializer`: DRF's `get_attribute` with its per-row checks cached. A missing attribute or key re-reads through the field, so DRF decides default/`None`/skip/error |
+| `get`      | fields with their own `get_attribute()` (related fields, ...): DRF's own `field.get_attribute()` |
 
 Conversions are inlined for `CharField` (and Email/Slug/URL/...), `IntegerField`,
 `BigIntegerField`, `FloatField`, `BooleanField`, `ChoiceField`, `UUIDField`,
@@ -141,10 +143,12 @@ where its assumptions don't hold.
   or slow database calls, fix those first. This package doesn't change what
   gets queried.
 - **When most fields fall back to DRF.** Run `explain()`. Fields marked `get`
-  or `generic` still go through DRF: `DecimalField`, `DurationField`, dotted
-  sources (`author.name`), properties, reverse one-to-one, hyperlinked fields,
-  custom fields, non-ISO date formats, and datetimes in a non-UTC timezone when
-  `USE_TZ=True`. A serializer made mostly of these gains little.
+  or `generic` still go through DRF: `DecimalField`, `DurationField`,
+  hyperlinked fields, custom fields, non-ISO date formats, and datetimes in a
+  non-UTC timezone when `USE_TZ=True`. A serializer made mostly of these gains
+  little. Fields marked `path` read the attribute with DRF's rules but skip its
+  per-row type checks; a source that is often missing (an optional annotation)
+  still goes through DRF on every miss.
 - **Slow `SerializerMethodField`s.** If a method does its own queries or heavy
   work, that cost is unchanged.
 
@@ -162,10 +166,15 @@ where its assumptions don't hold.
   itself is checked, not subclass instances.
 - **Code that expects DRF's per-row lookups.** A `SerializerMethodField`'s
   method is looked up once per serializer instead of once per row. A model
-  method used as a source (`source="get_summary"`) is checked once up front
-  instead of being re-inspected on every row.
-- **Switching timezones while a list is being consumed.** The active timezone
-  is read once per `many=True` call, not per row. If the input is a generator
+  method used as a source (`source="get_summary"`, or `author.get_summary`
+  along a dotted path) is checked once up front instead of being re-inspected
+  on every row. That check is cached per function, so replacing the method is
+  noticed, but changing an existing function's signature in place
+  (`__signature__`, `__defaults__`) is not.
+- **Switching timezones during serialization.** The active timezone is read
+  once by the outermost fast call (a `many=True` call, or a single object), and
+  shared with every serializer it calls, including nested ones that aren't
+  inlined, such as serializers with their own `to_representation`. If the input is a generator
   that yields rows inside different `timezone.override()` blocks, all rows are
   rendered in the timezone that was active when serialization started. Stock
   DRF uses each row's. `VERIFY` catches this.

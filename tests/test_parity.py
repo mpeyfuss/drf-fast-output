@@ -14,6 +14,7 @@ from django.test import override_settings
 from django.utils import timezone
 from django.utils.functional import SimpleLazyObject
 from rest_framework import serializers
+from rest_framework.fields import BuiltinSignatureError
 
 from drf_fast_output import FastModelSerializer, FastSerializer, explain, strict_equal
 from drf_fast_output.compiler import plan, stock_drf
@@ -94,9 +95,9 @@ def test_rich_plan(library):
     assert plans["reader_ids"] == ("prefetch", "readers", "pklist")
     assert plans["author_pk"] == ("attr", "author_id", "int")
     assert plans["editor_pk"] == ("attr", "editor_id", "raw")
-    assert plans["author_name"] == ("get", None, "str")
+    assert plans["author_name"] == ("path", None, "str")  # dotted source
     assert plans["tag_count"] == ("method", None, "raw")
-    assert plans["title_upper"] == ("get", None, "raw")
+    assert plans["title_upper"] == ("path", None, "raw")  # property
     assert plans["summary"] == ("call", "get_summary", "raw")
     assert plans["status_display"] == ("call", "get_status_display", "str")
 
@@ -356,7 +357,7 @@ def test_unknown_setting_key():
 def test_explain(library):
     text = explain(BookRichSerializer(Book.objects.all(), many=True))
     assert "author: access=fkobj author conv=nested" in text
-    assert "        profile: access=get conv=nested" in text
+    assert "        profile: access=path conv=nested" in text
 
 
 @override_settings(REST_FRAMEWORK={"COERCE_BIGINT_TO_STRING": True})
@@ -376,7 +377,7 @@ def test_bigint_plan(library):
 def test_explain_top_level_override(library):
     text = explain(CustomBookSerializer(Book.objects.first()))
     assert "not inlined" not in text
-    assert "tags: access=get conv=generic" in text  # CustomTagSerializer runs as-is
+    assert "tags: access=path conv=generic" in text  # CustomTagSerializer runs as-is
     assert "title: access=attr title conv=generic" in text
 
 
@@ -864,3 +865,268 @@ def test_verify_reports_the_failing_row(library, monkeypatch):
     monkeypatch.setattr(compiler, "_template_cache", {})
     with pytest.raises(AssertionError, match=r"BookAllSerializer\(many=True\)\[0\]"):
         BookAllSerializer(Book.objects.order_by("id"), many=True).data
+
+
+# --------------------------------------------------------------------------
+# Attribute paths (`path` and `self` access)
+# --------------------------------------------------------------------------
+
+
+class _Thing:
+    """Every kind of value DRF's get_attribute can meet along a source path."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+    @property
+    def prop(self):
+        return "p"
+
+    def simple(self):
+        return "called"
+
+    def with_default(self, x=1):
+        return x + 1
+
+    def needs_arg(self, x):  # not simple: DRF returns the bound method itself
+        return x
+
+    def raises_attr(self):
+        raise AttributeError("inner")
+
+    def raises_key(self):
+        raise KeyError("inner")
+
+    def raises_odne(self):
+        raise Author.DoesNotExist()
+
+    @property
+    def odne_prop(self):  # from getattr: DRF maps it to None
+        raise Author.DoesNotExist()
+
+    @staticmethod
+    def static():
+        return "static"
+
+
+class PathSerializer(FastSerializer):
+    prop = serializers.CharField()
+    simple = serializers.CharField()
+    with_default = serializers.IntegerField()
+    static = serializers.CharField()
+    deep = serializers.CharField(source="child.child.prop", allow_null=True)
+    deep_call = serializers.CharField(source="child.simple")
+    deep_key = serializers.CharField(source="data.inner.key")
+    odne = serializers.CharField(source="child.odne_prop")
+    missing_default = serializers.CharField(source="child.nope", default="dflt")
+    missing_null = serializers.CharField(source="child.nope", allow_null=True)
+    missing_skip = serializers.CharField(source="child.nope", required=False)
+    whole = serializers.ReadOnlyField(source="*")
+    level = serializers.ChoiceField(choices=[(1, "one"), (2, "two")])
+
+
+def _things():
+    leaf = _Thing()
+    return [
+        _Thing(child=_Thing(child=leaf), data={"inner": {"key": "k"}}, level=1),
+        _Thing(child=_Thing(child=None), data={"inner": {"key": 5}}, level=3),  # None mid-path
+        _Thing(child=_Thing(child=leaf), data={"inner": {"key": "k"}}, level=True),  # bool is not int
+    ]
+
+
+def test_paths_match_drf(parity):
+    def build():
+        ser = PathSerializer(_things(), many=True)
+        child = ser.child  # pyrefly: ignore[missing-attribute]
+        child.fields["whole"].to_representation = lambda value: type(value).__name__
+        return ser
+
+    out = parity(build)
+    assert out[0]["deep"] == "p"
+    assert out[0]["deep_call"] == "called"
+    assert out[0]["deep_key"] == "k"
+    assert out[0]["odne"] is None
+    assert out[0]["missing_default"] == "dflt"
+    assert out[0]["missing_null"] is None
+    assert "missing_skip" not in out[0]
+    assert out[0]["level"] == 1
+    assert out[1]["deep"] is None
+
+
+def test_paths_plan():
+    plans = plans_by_key(PathSerializer(_Thing()))
+    assert plans["deep"] == ("path", None, "str")
+    assert plans["level"] == ("path", None, "choice")
+    assert plans["whole"] == ("self", None, "raw")
+
+
+def test_path_to_method_with_required_arg(parity):
+    class S(FastSerializer):
+        m = serializers.ReadOnlyField(source="child.needs_arg")
+
+    def build():
+        ser = S(_Thing(child=_Thing()))
+        ser.fields["m"].to_representation = lambda value: value.__name__
+        return ser
+
+    assert parity(build) == {"m": "needs_arg"}
+
+
+@pytest.mark.parametrize(
+    ("source", "data", "exc"),
+    [
+        ("child.raises_attr", _Thing(child=_Thing()), ValueError),  # wrapped, not treated as missing
+        ("child.raises_key", _Thing(child=_Thing()), ValueError),
+        ("child.nope", _Thing(child=_Thing()), AttributeError),  # missing attribute, required
+        ("child.nope", {"child": {}}, KeyError),  # missing key, required
+        ("child.upper", _Thing(child="text"), BuiltinSignatureError),  # builtin method
+    ],
+)
+def test_path_errors_match_drf(source, data, exc):
+    class S(FastSerializer):
+        v = serializers.CharField(source=source)
+
+    with pytest.raises(exc) as fast_exc:
+        S(data).data
+    with stock_drf(), pytest.raises(exc) as drf_exc:
+        S(data).data
+    assert type(fast_exc.value) is type(drf_exc.value)
+    assert str(fast_exc.value) == str(drf_exc.value)
+
+
+def test_path_odne_from_a_called_method_propagates_like_drf():
+    class S(FastSerializer):
+        v = serializers.CharField(source="child.raises_odne", allow_null=True)
+
+    obj = _Thing(child=_Thing())
+    with pytest.raises(Author.DoesNotExist):
+        S(obj).data
+    with stock_drf(), pytest.raises(Author.DoesNotExist):
+        S(obj).data
+
+
+def test_path_function_patched_after_compile(parity):
+    """The simple-callable cache is per function, so a replaced method is re-checked."""
+
+    class S(FastSerializer):
+        v = serializers.ReadOnlyField(source="child.simple")
+
+    obj = _Thing(child=_Thing())
+    assert parity(lambda: S(obj)) == {"v": "called"}
+    with mock.patch.object(_Thing, "simple", lambda self, x: x):
+
+        def build():
+            ser = S(obj)
+            ser.fields["v"].to_representation = lambda value: callable(value)
+            return ser
+
+        assert parity(build) == {"v": True}  # not simple any more: not called
+
+
+def test_path_through_model_relations(library, parity):
+    """Dotted sources over select_related FKs and a reverse one-to-one."""
+
+    class S(FastModelSerializer):
+        author_name = serializers.CharField(source="author.name")
+        author_bio = serializers.CharField(source="author.profile.bio", allow_null=True)
+        editor_name = serializers.CharField(source="editor.name", allow_null=True)
+        status_display = serializers.CharField(source="author.__str__")
+
+        class Meta:
+            model = Book
+            fields = ["id", "author_name", "author_bio", "editor_name", "status_display"]
+
+    out = parity(lambda: S(RICH_QS().order_by("id"), many=True))
+    assert out[0]["author_bio"] == "Writes things"
+    assert out[1]["author_bio"] is None  # Bob has no profile: ObjectDoesNotExist
+
+
+def test_int_choices(parity):
+    class Level(enum.IntEnum):
+        ONE = 1
+        TWO = 2
+
+    class S(FastSerializer):
+        a = serializers.ChoiceField(choices=[(1, "one"), (2, "two")])
+        b = serializers.ChoiceField(choices=[("1", "one")])
+        c = serializers.ChoiceField(choices=Level)  # pyrefly: ignore[bad-argument-type]
+
+    rows = [SimpleNamespace(a=v, b=v, c=v) for v in (1, 2, 0, 7, -1, Level.ONE, True)]
+    parity(lambda: S(rows, many=True))
+
+
+def test_mapping_check_is_per_class(parity):
+    """A cached answer for a base class isn't reused for a subclass that is a Mapping."""
+    from collections.abc import Mapping
+
+    class Base:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    class Sub(Base):
+        def __getitem__(self, key):
+            return f"item-{key}"
+
+        def __iter__(self):
+            return iter(())
+
+        def __len__(self):
+            return 0
+
+    Mapping.register(Sub)  # pyrefly: ignore[missing-attribute]
+
+    class S(FastSerializer):
+        name = serializers.CharField()
+
+    assert parity(lambda: S(Base(name="attr"))) == {"name": "attr"}
+    assert parity(lambda: S(Sub(name="attr"))) == {"name": "item-name"}
+
+
+# --------------------------------------------------------------------------
+# Datetime mode shared with serializers that aren't inlined
+# --------------------------------------------------------------------------
+
+
+class _WhenStock(serializers.Serializer):
+    at = serializers.DateTimeField()
+
+
+class _WhenOverride(FastSerializer):
+    at = serializers.DateTimeField()
+
+    def to_representation(self, instance):
+        return {**super().to_representation(instance), "custom": True}
+
+
+class _Outer(FastSerializer):
+    at = serializers.DateTimeField()
+    inner = _WhenOverride(source="*")
+
+
+@pytest.mark.parametrize("tz", ["UTC", "America/New_York"])
+def test_not_inlined_children_share_the_datetime_mode(parity, tz, monkeypatch):
+    from drf_fast_output import compiler
+
+    rows = [{"at": dt.datetime(2024, 1, 1, i, tzinfo=dt.timezone.utc)} for i in range(5)]
+    calls = []
+    real = compiler._current_datetime_mode
+    monkeypatch.setattr(compiler, "_current_datetime_mode", lambda: calls.append(1) or real())
+    with timezone.override(zoneinfo.ZoneInfo(tz)):
+        _Outer(rows, many=True).data
+        assert len(calls) == 1  # once for the list, not per row or per nested serializer
+        _WhenOverride(rows, many=True).data  # a child that isn't inlineable
+        assert len(calls) == 2
+        out = parity(lambda: _Outer(rows, many=True))
+        parity(lambda: _WhenOverride(rows, many=True))
+    assert out[0]["inner"]["custom"] is True
+
+
+def test_datetime_mode_is_reset_after_the_call(monkeypatch):
+    from drf_fast_output.compiler import active_dtm
+
+    rows = [{"at": dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)}]
+    _Outer(rows, many=True).data
+    _Outer(rows[0]).data
+    assert active_dtm.get() is None
+    with timezone.override(zoneinfo.ZoneInfo("Asia/Tokyo")):
+        assert _Outer(rows[0]).data["at"] == "2024-01-01T09:00:00+09:00"
