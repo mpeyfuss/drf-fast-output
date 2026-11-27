@@ -3,6 +3,15 @@
 Faster output serialization for Django REST Framework read endpoints, with the
 same output as stock DRF.
 
+> [!IMPORTANT]
+> **Use it for list endpoints and large nested payloads, not detail views.**
+> Output is identical to DRF everywhere, but only lists get faster. A single
+> object is rendered by DRF's own field loop plus a small dispatch cost, so
+> detail and write endpoints break even or run slightly slower (2–10% in the
+> benchmarks below). The exception is a single object containing a nested list
+> of 10+ rows, which is compiled. To keep a serializer exactly stock, set
+> `Meta.fast_output = False`, or apply `fast_output()` only to your list views.
+
 DRF's `Serializer.to_representation` does a lot of generic work for every field
 of every row: `field.get_attribute()` → `fields.get_attribute()` → `getattr`, a
 `PKOnlyObject` check, a method call to `field.to_representation()`, and for
@@ -15,15 +24,16 @@ same serializer as plain DRF classes vs fast:
 
 | case | 1 row | 5 rows | 25 rows | 2000 rows |
 |---|---|---|---|---|
-| `ModelSerializer`, `fields='__all__'` | 0.91x | 1.37x | 2.61x | 5.9x |
-| Nested (FK, O2O, reverse FK, M2M, method fields) | 0.91x | 1.30x | 2.45x | 3.9x |
-| `fast_output()` on a stock serializer | 0.83x | 1.07x | 1.95x | 5.5x |
+| `ModelSerializer`, `fields='__all__'` | 0.98x | 1.37x | 2.68x | 6.0x |
+| Nested (FK, O2O, reverse FK, M2M, method fields) | 0.95x | 1.33x | 2.5x | 4.4x |
+| `fast_output()` on a stock serializer | 0.97x | 1.08x | 1.96x | 5.3x |
 
-The small-row numbers include constructing the serializer. A single object is
-somewhat slower (up to ~17%), and everything from a handful of rows up gets
-faster. Compiled plans are shared by every serializer instance with the
-same field configuration, so each request only pays for binding its own field
-objects.
+The small-row numbers include constructing the serializer. Single objects use
+DRF's field loop by default, avoiding compilation setup; a small dispatch and
+nested-field adaptation cost remains. Lists use compiled rows. Compiled plans
+are shared by serializer instances with the same field configuration, so each
+request still builds its DRF fields, checks their configuration, and binds its
+own row function. Timings vary by environment and serializer shape.
 
 ## Usage
 
@@ -59,14 +69,45 @@ class BookList(generics.ListAPIView):
     serializer_class = fast_output(BookSerializer)  # cached subclass, same name/Meta
 ```
 
-Nested serializers are compiled into the parent automatically, even plain DRF
-ones. Only output changes. Validation, `is_valid()` and `save()` are stock DRF.
+On the compiled path, nested serializers are compiled into the parent
+automatically, even plain DRF ones. Only output changes. Validation,
+`is_valid()` and `save()` are stock DRF.
+
+### Single objects
+
+Single-object calls use DRF by default. Nested plain DRF serializer fields are
+adapted on the copied field instances so their lists can still use compiled
+rows. Already-loaded nested lists with fewer than 10 rows use DRF too; larger
+ones compile. This size check only inspects lists, tuples, and populated queryset
+caches: it never counts a query or reads ahead in a generator. Unknown-length
+nested collections and top-level `many=True` calls use the compiled path.
+Custom `list_serializer_class` implementations are left alone.
+
+A detail response containing 200 plain nested dictionary rows measured 2.68x
+faster than stock DRF. With three nested rows it measured 0.93x (about 2 µs of
+overhead). The threshold is a heuristic, not a guarantee of a speedup.
+
+To force the previous single-object compilation behavior, for example when
+reusing a serializer for repeated `to_representation()` calls:
+
+```python
+class BookSerializer(FastModelSerializer):
+    fast_output_single = True
+
+    class Meta:
+        model = Book
+        fields = "__all__"
+```
+
+`ENABLED=False` and `Meta.fast_output=False` still take precedence. `VERIFY`
+checks output where compiled rows run; a single object already using DRF does
+not need a second reference pass.
 
 ### Write endpoints
 
 Fast serializers work on write endpoints. `is_valid()`, `create()`, `update()`
-and `save()` are untouched, and the response after `save()` goes through the
-fast path. The view mixin only switches serializers for reads by default. To
+and `save()` are untouched, and the response after `save()` uses the same
+automatic selection described above. The view mixin only switches serializers for reads by default. To
 include write responses, set `fast_output_methods`:
 
 ```python
@@ -84,7 +125,7 @@ gives the same bytes it would without this package. That includes DRF's
 `JSONRenderer`, [drf-orjson-renderer](https://github.com/brianjbuck/drf_orjson_renderer),
 and XML or YAML renderers. The two speedups combine: on the nested benchmark
 above, `JSONRenderer` takes 7.2 ms to render what this package serializes in
-about 50 ms, and `ORJSONRenderer` takes 1.6 ms.
+about 42 ms, and `ORJSONRenderer` takes 1.6 ms.
 
 ## What gets inlined
 
@@ -97,7 +138,9 @@ Each readable field gets an **access** strategy and a **conversion**:
 | `prefetch` | to-many relations: reads Django's prefetch cache when populated  |
 | `call`     | model method sources such as `get_FOO_display`                   |
 | `method`   | `SerializerMethodField`                                          |
-| `get`      | everything else: DRF's own `field.get_attribute()`               |
+| `self`     | `source="*"`: the instance itself                                |
+| `path`     | dotted sources (`author.profile.bio`), properties, annotations, dict keys, and every field of a plain `Serializer`: DRF's `get_attribute` with its per-row checks cached. A missing attribute or key re-reads through the field, so DRF decides default/`None`/skip/error |
+| `get`      | fields with their own `get_attribute()` (related fields, ...): DRF's own `field.get_attribute()` |
 
 Conversions are inlined for `CharField` (and Email/Slug/URL/...), `IntegerField`,
 `BigIntegerField`, `FloatField`, `BooleanField`, `ChoiceField`, `UUIDField`,
@@ -129,22 +172,26 @@ where its assumptions don't hold.
 
 **It won't be faster:**
 
-- **Single-object endpoints** (detail views, write responses) are a little slower,
-  at 0.83–0.91x of stock DRF in the benchmark. The gains need several rows, or nested lists
-  inside the object (a detail view with 200 nested rows measured 1.5x). One
-  edge case is a single object rendered through several small nested
-  serializers. Each one is compiled for that request, and the setup can cost
-  more than it saves. The worst case measured was about 6% slower. If an
-  endpoint like that matters, give it a regular DRF serializer, or set
-  `Meta.fast_output = False` on its serializer.
+- **Single-object endpoints** (detail views, write responses) now avoid
+  compilation by default but retain dispatch and nested-field adaptation
+  overhead. The model examples above measured 2–3% slower than stock DRF;
+  a tiny dictionary serializer measured 11.8 µs stock versus 13.8 µs here.
+  Use a regular DRF serializer when even that overhead matters. Forcing
+  `fast_output_single=True` can cost more than it saves on a fresh instance.
+- **Very small lists.** Compilation setup may outweigh the per-row savings.
+  The five-row dictionary benchmark measured 0.79x. Automatic fallback for
+  small, already-loaded nested lists helps detail responses; top-level lists
+  continue to compile regardless of size.
 - **When serialization isn't the bottleneck.** If the endpoint has N+1 queries
   or slow database calls, fix those first. This package doesn't change what
   gets queried.
 - **When most fields fall back to DRF.** Run `explain()`. Fields marked `get`
-  or `generic` still go through DRF: `DecimalField`, `DurationField`, dotted
-  sources (`author.name`), properties, reverse one-to-one, hyperlinked fields,
-  custom fields, non-ISO date formats, and datetimes in a non-UTC timezone when
-  `USE_TZ=True`. A serializer made mostly of these gains little.
+  or `generic` still go through DRF: `DecimalField`, `DurationField`,
+  hyperlinked fields, custom fields, non-ISO date formats, and datetimes in a
+  non-UTC timezone when `USE_TZ=True`. A serializer made mostly of these gains
+  little. Fields marked `path` read the attribute with DRF's rules but skip its
+  per-row type checks; a source that is often missing (an optional annotation)
+  still goes through DRF on every miss.
 - **Slow `SerializerMethodField`s.** If a method does its own queries or heavy
   work, that cost is unchanged.
 
@@ -162,17 +209,23 @@ where its assumptions don't hold.
   itself is checked, not subclass instances.
 - **Code that expects DRF's per-row lookups.** A `SerializerMethodField`'s
   method is looked up once per serializer instead of once per row. A model
-  method used as a source (`source="get_summary"`) is checked once up front
-  instead of being re-inspected on every row.
-- **Switching timezones while a list is being consumed.** The active timezone
-  is read once per `many=True` call, not per row. If the input is a generator
+  method used as a source (`source="get_summary"`, or `author.get_summary`
+  along a dotted path) is checked once up front instead of being re-inspected
+  on every row. That check is cached per function, so replacing the method is
+  noticed, but changing an existing function's signature in place
+  (`__signature__`, `__defaults__`) is not.
+- **Switching timezones during compiled serialization.** The active timezone is read
+  once per compiled call (a `many=True` list, or a single object compiled on
+  its own) and used for everything inlined into it. Serializers it calls but
+  doesn't inline, such as ones with their own `to_representation` that wrap
+  `super()` in `timezone.override()`, read their own. If the input is a generator
   that yields rows inside different `timezone.override()` blocks, all rows are
   rendered in the timezone that was active when serialization started. Stock
   DRF uses each row's. `VERIFY` catches this.
 
 **Other things to know:**
 
-- **`VERIFY` runs every serialization twice.** Method fields run twice and
+- **`VERIFY` runs compiled serialization twice.** Method fields run twice and
   queries can double, so use it in tests, not production.
 - **Compiled code is cached per field configuration, up to 512 entries.**
   Endpoints whose fields are chosen by the client (sparse fieldsets via
@@ -201,7 +254,7 @@ DRF_FAST_OUTPUT = {
 }
 ```
 
-Turn on **`VERIFY` in your test settings**. Every fast serialization is then
+Turn on **`VERIFY` in your test settings**. Every compiled serialization is then
 compared against stock DRF, checking types and key order as well, so `1` vs `True` or a
 reordered dict fails loudly. Lists are compared row by row as they are consumed,
 so generators behave as they do without `VERIFY`.

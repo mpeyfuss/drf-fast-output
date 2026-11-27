@@ -8,10 +8,11 @@ from decimal import Decimal
 from typing import Any, TypeVar
 
 from django.db.models.manager import BaseManager
+from django.db.models.query import QuerySet
 from rest_framework import serializers as s
 
 from . import compiler, conf
-from .compiler import DT_OTHER, datetime_mode, force_drf, passthrough, stock_drf
+from .compiler import DT_OTHER, datetime_mode, force_drf, in_fast_call, passthrough, stock_drf
 
 __all__ = [
     "FastListSerializer",
@@ -79,6 +80,21 @@ class FastOutputMixin:
     saving are stock DRF. Opt a serializer out with ``Meta.fast_output = False``.
     """
 
+    fast_output_single = False
+
+    def get_fields(self) -> dict:
+        fields = super().get_fields()  # type: ignore[misc]
+        # Adapt only this instance's copied fields. Keep nested collections fast
+        # even when their parent takes the single-object DRF path. Nested single
+        # serializers propagate this lazily when their own fields are built.
+        if compiler.opted_in(self):
+            for field in fields.values():
+                if type(field) is s.ListSerializer:
+                    field.__class__ = FastListSerializer
+                elif isinstance(field, s.Serializer) and not isinstance(field, FastOutputMixin):
+                    field.__class__ = fast_output(type(field))
+        return fields
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
         mro = cls.__mro__
@@ -99,10 +115,23 @@ class FastOutputMixin:
 
     @passthrough
     def to_representation(self, instance: Any) -> Any:
-        row = None if force_drf.get() or not compiler.enabled() else self._fast_output_row
+        if force_drf.get() or not compiler.enabled():
+            return super().to_representation(instance)  # type: ignore[misc]
+        nested = in_fast_call.get()
+        if not (self.fast_output_single or nested or _custom_list_child(self)):
+            return super().to_representation(instance)  # type: ignore[misc]
+        row = self._fast_output_row
         if row is None:
             return super().to_representation(instance)  # type: ignore[misc]
-        out = row(instance, datetime_mode() if row.needs_dtm else DT_OTHER)
+        dtm = datetime_mode() if row.needs_dtm else DT_OTHER
+        if nested:
+            out = row(instance, dtm)
+        else:
+            token = in_fast_call.set(True)
+            try:
+                out = row(instance, dtm)
+            finally:
+                in_fast_call.reset(token)
         if conf.get("VERIFY"):
             _verify(
                 out,
@@ -121,6 +150,15 @@ class FastOutputMixin:
         return ls
 
 
+def _custom_list_child(serializer: Any) -> bool:
+    # A row of a list serializer we don't swap (a custom list_serializer_class,
+    # or a hand-built ListSerializer(child=...)): its loop calls the child per
+    # row, so compile like a list would. FastListSerializer's own small-list
+    # fallback to DRF is deliberate and stays uncompiled.
+    parent = serializer.parent
+    return isinstance(parent, s.ListSerializer) and not isinstance(parent, FastListSerializer)
+
+
 _EMPTY = object()
 
 
@@ -137,7 +175,28 @@ class FastListSerializer(s.ListSerializer):
 
     @passthrough
     def to_representation(self, data: Any) -> list:
-        if force_drf.get() or not compiler.enabled() or not self._fast_output_ok:
+        if force_drf.get() or not compiler.enabled():
+            return super().to_representation(data)
+        if in_fast_call.get():
+            return self._fast_representation(data)
+        if self.parent is not None and not getattr(self.child, "fast_output_single", False):
+            # A detail response's tiny nested collections have the same setup
+            # problem as a single object. Only inspect already-materialized data;
+            # never count a queryset or consume a generator to choose a path.
+            data = data.all() if isinstance(data, BaseManager) else data
+            cached = data._result_cache if isinstance(data, QuerySet) else data
+            if isinstance(cached, (list, tuple)) and len(cached) < 10:
+                return super().to_representation(data)
+        # The outermost fast call: children that aren't inlineable (DRF's loop
+        # calls them row by row) compile too.
+        token = in_fast_call.set(True)
+        try:
+            return self._fast_representation(data)
+        finally:
+            in_fast_call.reset(token)
+
+    def _fast_representation(self, data: Any) -> list:
+        if not self._fast_output_ok:
             return super().to_representation(data)
         it = iter(data.all() if isinstance(data, BaseManager) else data)
         first = next(it, _EMPTY)
