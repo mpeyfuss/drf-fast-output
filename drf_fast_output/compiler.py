@@ -275,12 +275,21 @@ _FIELD_CLASS_DEPS = (
 
 
 def _field_class(t: type) -> _FieldClass:
-    cached = _own(t, _FIELD_CLASS_ATTR)
-    deps = tuple([getattr(t, name, None) for name in _FIELD_CLASS_DEPS])
-    if deps[0] in _PASSTHROUGH_FNS:
+    # Runs for every field of every serializer instance: the reads are spelled
+    # out (one per _FIELD_CLASS_DEPS entry, in order) rather than looped.
+    cached = t.__dict__.get(_FIELD_CLASS_ATTR)
+    to_rep = getattr(t, "to_representation", None)
+    if to_rep in _PASSTHROUGH_FNS:
         # The classification depends on the method behind the passthrough
         # (e.g. ListSerializer.to_representation), so that is what to watch.
-        deps = (_resolve_impl(t, _FIELD_CLASS_DEPS[0], None)[1], *deps[1:])
+        to_rep = _resolve_impl(t, "to_representation", None)[1]
+    deps = (
+        to_rep,
+        getattr(t, "get_attribute", None),
+        getattr(t, "enforce_timezone", None),
+        getattr(t, "default_timezone", None),
+        getattr(t, "use_pk_only_optimization", None),
+    )
     if cached is not None and cached[0] == deps:
         return cached[1]
     info = _classify_field_class(t)
@@ -421,14 +430,19 @@ class _ModelAttr(NamedTuple):
 
 
 def _model_attr(model: type[Model], name: str) -> _ModelAttr:
-    per = _class_memo(model, _MODEL_ATTRS_ATTR)
+    per = model.__dict__.get(_MODEL_ATTRS_ATTR) or _class_memo(model, _MODEL_ATTRS_ATTR)
     # What _describe_model_attr() depends on that can be patched at runtime:
     # serializable_value, and what `name` is on the class. The latter is read
     # from the class dicts like inspect.getattr_static (descriptors such as
     # partialmethod return a new object on every class attribute access), but
     # cheaper, as this runs for every field of every serializer instance.
     sv = model.serializable_value
-    static = next((k.__dict__[name] for k in model.__mro__ if name in k.__dict__), None)
+    static = None
+    for k in model.__mro__:
+        d = k.__dict__
+        if name in d:
+            static = d[name]
+            break
     hit = per.get(name)
     if hit is not None and hit[0] is sv and hit[1] is static:
         return hit[2]
