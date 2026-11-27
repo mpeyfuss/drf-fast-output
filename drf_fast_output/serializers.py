@@ -12,7 +12,7 @@ from django.db.models.query import QuerySet
 from rest_framework import serializers as s
 
 from . import compiler, conf
-from .compiler import active_dtm, datetime_mode, force_drf, passthrough, stock_drf
+from .compiler import DT_OTHER, datetime_mode, force_drf, in_fast_call, passthrough, stock_drf
 
 __all__ = [
     "FastListSerializer",
@@ -117,21 +117,21 @@ class FastOutputMixin:
     def to_representation(self, instance: Any) -> Any:
         if force_drf.get() or not compiler.enabled():
             return super().to_representation(instance)  # type: ignore[misc]
-        if not self.fast_output_single and active_dtm.get() is None:
+        nested = in_fast_call.get()
+        if not (self.fast_output_single or nested or _custom_list_child(self)):
             return super().to_representation(instance)  # type: ignore[misc]
         row = self._fast_output_row
         if row is None:
             return super().to_representation(instance)  # type: ignore[misc]
-        dtm = active_dtm.get()
-        if dtm is not None:
+        dtm = datetime_mode() if row.needs_dtm else DT_OTHER
+        if nested:
             out = row(instance, dtm)
-        else:  # the outermost fast call: decide it once for everything below
-            dtm = datetime_mode()
-            token = active_dtm.set(dtm)
+        else:
+            token = in_fast_call.set(True)
             try:
                 out = row(instance, dtm)
             finally:
-                active_dtm.reset(token)
+                in_fast_call.reset(token)
         if conf.get("VERIFY"):
             _verify(
                 out,
@@ -148,6 +148,15 @@ class FastOutputMixin:
         if type(ls) is s.ListSerializer:
             ls.__class__ = FastListSerializer
         return ls
+
+
+def _custom_list_child(serializer: Any) -> bool:
+    # A row of a list serializer we don't swap (a custom list_serializer_class,
+    # or a hand-built ListSerializer(child=...)): its loop calls the child per
+    # row, so compile like a list would. FastListSerializer's own small-list
+    # fallback to DRF is deliberate and stays uncompiled.
+    parent = serializer.parent
+    return isinstance(parent, s.ListSerializer) and not isinstance(parent, FastListSerializer)
 
 
 _EMPTY = object()
@@ -168,7 +177,7 @@ class FastListSerializer(s.ListSerializer):
     def to_representation(self, data: Any) -> list:
         if force_drf.get() or not compiler.enabled():
             return super().to_representation(data)
-        if active_dtm.get() is not None:
+        if in_fast_call.get():
             return self._fast_representation(data)
         if self.parent is not None and not getattr(self.child, "fast_output_single", False):
             # A detail response's tiny nested collections have the same setup
@@ -178,13 +187,13 @@ class FastListSerializer(s.ListSerializer):
             cached = data._result_cache if isinstance(data, QuerySet) else data
             if isinstance(cached, (list, tuple)) and len(cached) < 10:
                 return super().to_representation(data)
-        # The outermost fast call: one datetime mode for every row, even when
-        # the child isn't inlineable and DRF's loop calls it row by row.
-        token = active_dtm.set(datetime_mode())
+        # The outermost fast call: children that aren't inlineable (DRF's loop
+        # calls them row by row) compile too.
+        token = in_fast_call.set(True)
         try:
             return self._fast_representation(data)
         finally:
-            active_dtm.reset(token)
+            in_fast_call.reset(token)
 
     def _fast_representation(self, data: Any) -> list:
         if not self._fast_output_ok:
@@ -195,7 +204,7 @@ class FastListSerializer(s.ListSerializer):
             return []  # like DRF, without building the child's fields
         child: Any = self.child
         row = compiler.get_row(child)  # compiled on the first row, then cached on the child
-        dtm = datetime_mode()
+        dtm = datetime_mode() if row.needs_dtm else DT_OTHER
         items = itertools.chain((first,), it)
         if not conf.get("VERIFY"):
             return [row(o, dtm) for o in items]

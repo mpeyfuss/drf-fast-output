@@ -117,3 +117,23 @@ def test_disabled_nested_lists_do_not_compile():
         patch.object(compiler, "get_row", side_effect=AssertionError("compiled")),
     ):
         assert ser.data == {"group": {"items": [{"name": "one"}]}}
+
+
+def test_custom_list_children_compile():
+    class MyList(serializers.ListSerializer):
+        pass
+
+    class Child(FastSerializer):
+        name = serializers.CharField()
+
+        class Meta:
+            list_serializer_class = MyList
+
+    rows = [{"name": str(i)} for i in range(3)]
+    ser = Child(rows, many=True)
+    assert type(ser) is MyList
+    assert ser.data == rows
+    assert compiler._ROW_ATTR in ser.child.__dict__
+    hand_built = serializers.ListSerializer(rows, child=fast_output(Item)())
+    assert hand_built.data == rows
+    assert compiler._ROW_ATTR in hand_built.child.__dict__

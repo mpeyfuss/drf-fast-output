@@ -6,6 +6,7 @@ import zoneinfo
 from collections import OrderedDict
 from decimal import Decimal
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -650,6 +651,7 @@ os.environ["DJANGO_SETTINGS_MODULE"] = "tests.settings"
 import django
 django.setup()
 from types import SimpleNamespace
+from typing import Any
 from rest_framework import serializers
 serializers.CharField.to_representation = lambda self, value: "PATCHED"
 from drf_fast_output import FastSerializer
@@ -1117,30 +1119,49 @@ class _Outer(FastSerializer):
     inner = _WhenOverride(source="*")
 
 
+class _TokyoWhen(FastSerializer):
+    at = serializers.DateTimeField()
+
+    def to_representation(self, instance):
+        with timezone.override(zoneinfo.ZoneInfo("Asia/Tokyo")):
+            return super().to_representation(instance)
+
+
+class _OuterTokyo(FastSerializer):
+    at = serializers.DateTimeField()
+    inner = _TokyoWhen(source="*")
+
+
 @pytest.mark.parametrize("tz", ["UTC", "America/New_York"])
-def test_not_inlined_children_share_the_datetime_mode(parity, tz, monkeypatch):
+def test_not_inlined_children_compile_inside_lists(parity, tz):
     from drf_fast_output import compiler
 
     rows = [{"at": dt.datetime(2024, 1, 1, i, tzinfo=dt.timezone.utc)} for i in range(5)]
-    calls = []
-    real = compiler._current_datetime_mode
-    monkeypatch.setattr(compiler, "_current_datetime_mode", lambda: calls.append(1) or real())
     with timezone.override(zoneinfo.ZoneInfo(tz)):
-        _Outer(rows, many=True).data
-        assert len(calls) == 1  # once for the list, not per row or per nested serializer
-        _WhenOverride(rows, many=True).data  # a child that isn't inlineable
-        assert len(calls) == 2
+        many: Any = _WhenOverride(rows, many=True)
+        many.data  # a child that isn't inlineable: DRF's loop, compiled rows
+        assert compiler._ROW_ATTR in many.child.__dict__
         out = parity(lambda: _Outer(rows, many=True))
         parity(lambda: _WhenOverride(rows, many=True))
     assert out[0]["inner"]["custom"] is True
 
 
-def test_datetime_mode_is_reset_after_the_call(monkeypatch):
-    from drf_fast_output.compiler import active_dtm
+@pytest.mark.parametrize("tz", ["UTC", "America/New_York"])
+def test_not_inlined_children_read_their_own_timezone(parity, tz):
+    rows = [{"at": dt.datetime(2024, 1, 1, i, tzinfo=dt.timezone.utc)} for i in range(5)]
+    with timezone.override(zoneinfo.ZoneInfo(tz)):
+        out = parity(lambda: _OuterTokyo(rows, many=True))
+        parity(lambda: _TokyoWhen(rows, many=True))
+    assert out[0]["inner"]["at"] == "2024-01-01T09:00:00+09:00"
+    assert out[0]["at"] != out[0]["inner"]["at"]
+
+
+def test_fast_call_flag_is_reset_after_the_call():
+    from drf_fast_output.compiler import in_fast_call
 
     rows = [{"at": dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)}]
     _Outer(rows, many=True).data
     _Outer(rows[0]).data
-    assert active_dtm.get() is None
+    assert in_fast_call.get() is False
     with timezone.override(zoneinfo.ZoneInfo("Asia/Tokyo")):
         assert _Outer(rows[0]).data["at"] == "2024-01-01T09:00:00+09:00"

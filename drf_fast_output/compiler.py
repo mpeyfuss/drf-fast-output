@@ -97,21 +97,18 @@ DT_OTHER, DT_UTC, DT_NAIVE = 0, 1, 2
 _UTC_KEYS = frozenset({"UTC", "Etc/UTC"})
 
 
-# The datetime mode of the outermost fast call in progress, shared with the
-# serializers it calls that aren't inlined into it (e.g. a nested serializer
-# with its own to_representation, or every row of a list whose child isn't
-# inlineable). The active timezone is a thread/async-local lookup, too slow to
-# repeat per row.
-active_dtm: ContextVar[int | None] = ContextVar("drf_fast_output_dtm", default=None)
+# True while a compiled call (a list, or a single object with
+# fast_output_single) is in progress, so the single-object serializers it calls
+# but doesn't inline (e.g. one with its own to_representation) compile too.
+in_fast_call: ContextVar[bool] = ContextVar("drf_fast_output_in_fast_call", default=False)
 
 
 def datetime_mode() -> int:
-    """The datetime mode for the active timezone, or of the enclosing fast call."""
-    dtm = active_dtm.get()
-    return _current_datetime_mode() if dtm is None else dtm
-
-
-def _current_datetime_mode() -> int:
+    """
+    The datetime mode for the active timezone. Read per compiled call, never
+    shared with the serializers it calls but doesn't inline: those may switch
+    the timezone themselves (``timezone.override()`` in a to_representation).
+    """
     if not dj_settings.USE_TZ:
         return DT_NAIVE
     tz = dj_timezone.get_current_timezone()
@@ -275,21 +272,12 @@ _FIELD_CLASS_DEPS = (
 
 
 def _field_class(t: type) -> _FieldClass:
-    # Runs for every field of every serializer instance: the reads are spelled
-    # out (one per _FIELD_CLASS_DEPS entry, in order) rather than looped.
-    cached = t.__dict__.get(_FIELD_CLASS_ATTR)
-    to_rep = getattr(t, "to_representation", None)
-    if to_rep in _PASSTHROUGH_FNS:
+    cached = t.__dict__.get(_FIELD_CLASS_ATTR)  # runs per field per instance: no helper call
+    deps = tuple([getattr(t, name, None) for name in _FIELD_CLASS_DEPS])
+    if deps[0] in _PASSTHROUGH_FNS:
         # The classification depends on the method behind the passthrough
         # (e.g. ListSerializer.to_representation), so that is what to watch.
-        to_rep = _resolve_impl(t, "to_representation", None)[1]
-    deps = (
-        to_rep,
-        getattr(t, "get_attribute", None),
-        getattr(t, "enforce_timezone", None),
-        getattr(t, "default_timezone", None),
-        getattr(t, "use_pk_only_optimization", None),
-    )
+        deps = (_resolve_impl(t, _FIELD_CLASS_DEPS[0], None)[1], *deps[1:])
     if cached is not None and cached[0] == deps:
         return cached[1]
     info = _classify_field_class(t)

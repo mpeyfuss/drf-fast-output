@@ -3,6 +3,15 @@
 Faster output serialization for Django REST Framework read endpoints, with the
 same output as stock DRF.
 
+> [!IMPORTANT]
+> **Use it for list endpoints and large nested payloads, not detail views.**
+> Output is identical to DRF everywhere, but only lists get faster. A single
+> object is rendered by DRF's own field loop plus a small dispatch cost, so
+> detail and write endpoints break even or run slightly slower (2–10% in the
+> benchmarks below). The exception is a single object containing a nested list
+> of 10+ rows, which is compiled. To keep a serializer exactly stock, set
+> `Meta.fast_output = False`, or apply `fast_output()` only to your list views.
+
 DRF's `Serializer.to_representation` does a lot of generic work for every field
 of every row: `field.get_attribute()` → `fields.get_attribute()` → `getattr`, a
 `PKOnlyObject` check, a method call to `field.to_representation()`, and for
@@ -206,10 +215,10 @@ where its assumptions don't hold.
   noticed, but changing an existing function's signature in place
   (`__signature__`, `__defaults__`) is not.
 - **Switching timezones during compiled serialization.** The active timezone is read
-  once by the outermost compiled call (a `many=True` call, or a single object
-  with `fast_output_single=True`), and
-  shared with every serializer it calls, including nested ones that aren't
-  inlined, such as serializers with their own `to_representation`. If the input is a generator
+  once per compiled call (a `many=True` list, or a single object compiled on
+  its own) and used for everything inlined into it. Serializers it calls but
+  doesn't inline, such as ones with their own `to_representation` that wrap
+  `super()` in `timezone.override()`, read their own. If the input is a generator
   that yields rows inside different `timezone.override()` blocks, all rows are
   rendered in the timezone that was active when serialization started. Stock
   DRF uses each row's. `VERIFY` catches this.
