@@ -1,6 +1,6 @@
 [project]
 name = "drf-fast-output"
-version = "0.1.0"
+version = "0.2.0"
 description = "Faster output serialization for Django REST Framework read endpoints"
 readme = "README.md"
 license = "MIT"
