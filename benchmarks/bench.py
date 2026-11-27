@@ -96,18 +96,22 @@ def bench(label, drf_cls, fast_cls, rows):
 
 def bench_small(label, drf_cls, fast_cls, rows, sizes=(1, 5, 25), number=200):
     """Small result sets, including serializer construction and compilation."""
+    compiled_cls = type("Compiled", (fast_cls,), {"fast_output_single": True})
     label = label.split(" (")[0]
     for n in sizes:
         if n == 1:
             obj = rows[0]
             drf = best(lambda obj=obj: drf_cls(obj).data, number)
             fast = best(lambda obj=obj: fast_cls(obj).data, number)
+            compiled = best(lambda obj=obj: compiled_cls(obj).data, number)
         else:
             items = rows[:n]
             drf = best(lambda items=items: drf_cls(items, many=True).data, number)
             fast = best(lambda items=items: fast_cls(items, many=True).data, number)
+            compiled = best(lambda items=items: compiled_cls(items, many=True).data, number)
         print(
-            f"{label:<34} n={n:<3} drf {drf * 1e6:6.0f} us   fast {fast * 1e6:6.0f} us   {drf / fast:5.2f}x"
+            f"{label:<34} n={n:<3} drf {drf * 1e6:6.1f} us   "
+            f"auto {fast * 1e6:6.1f} us   compiled {compiled * 1e6:6.1f} us   {drf / fast:5.2f}x"
         )
 
 
@@ -117,3 +121,19 @@ for case in CASES:
 print("\nsmall result sets (incl. serializer setup):")
 for case in CASES:
     bench_small(*case)
+
+
+class CollectionSerializer(serializers.Serializer):
+    books = DictBookSerializer(many=True)
+
+
+print("\nsingle object containing a plain DRF nested list:")
+for count in (3, 200):
+    obj = {"books": [dict_rows[0].copy() for _ in range(count)]}
+    bench_small(
+        f"Detail with {count} nested rows",
+        CollectionSerializer,
+        fast_output(CollectionSerializer),
+        [obj],
+        sizes=(1,),
+    )

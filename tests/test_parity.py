@@ -16,7 +16,7 @@ from django.utils.functional import SimpleLazyObject
 from rest_framework import serializers
 from rest_framework.fields import BuiltinSignatureError
 
-from drf_fast_output import FastModelSerializer, FastSerializer, explain, strict_equal
+from drf_fast_output import FastModelSerializer, FastOutputMixin, FastSerializer, explain, strict_equal
 from drf_fast_output.compiler import plan, stock_drf
 from tests.testapp.models import Author, Book, Chapter, Note, SpecialBook, Tag
 from tests.testapp.serializers import (
@@ -30,6 +30,14 @@ from tests.testapp.serializers import (
 )
 
 pytestmark = pytest.mark.django_db
+
+
+@pytest.fixture(autouse=True, params=[False, True], ids=["auto", "compile-single"])
+def single_mode(request, monkeypatch):
+    # Exercise output parity in both modes; single-object compiler coverage must
+    # not silently become DRF-versus-DRF coverage after introducing auto mode.
+    monkeypatch.setattr(FastOutputMixin, "fast_output_single", request.param)
+
 
 RICH_QS = lambda: Book.objects.select_related(  # noqa: E731
     "author__profile", "editor__profile"
@@ -345,8 +353,10 @@ def test_verify_mode_catches_divergence(library, monkeypatch):
     monkeypatch.setitem(compiler._CONV, "str", ["{v} = 'wrong'"])
     monkeypatch.setattr(compiler, "_factory_cache", {})
     monkeypatch.setattr(compiler, "_template_cache", {})
+    ser = BookAllSerializer(Book.objects.first())
+    ser.fast_output_single = True
     with pytest.raises(AssertionError, match="differs from DRF"):
-        BookAllSerializer(Book.objects.first()).data
+        ser.data
 
 
 def test_unknown_setting_key():
@@ -450,6 +460,8 @@ def test_template_cache_is_bounded(library, monkeypatch):
     for i in range(len(names)):
 
         class Sparse(FastModelSerializer):
+            fast_output_single = True
+
             class Meta:
                 model = Book
                 fields = names[: i + 1]
@@ -806,6 +818,7 @@ def test_empty_list_does_not_build_child_fields(db):
 def test_disabling_applies_to_already_compiled_instances(library):
     b1 = library["b1"]
     single, many = BookAllSerializer(b1), BookAllSerializer([b1], many=True)
+    single.fast_output_single = True
     single.data, many.data  # compile both
     shout = lambda self, value: "PATCHED"  # noqa: E731  # only stock DRF calls the class method now
     with (
@@ -819,6 +832,7 @@ def test_disabling_applies_to_already_compiled_instances(library):
 
 def test_enabling_applies_to_instances_first_used_while_disabled(library):
     ser = BookAllSerializer(library["b1"])
+    ser.fast_output_single = True
     with override_settings(DRF_FAST_OUTPUT={"ENABLED": False}):
         ser.to_representation(library["b1"])
         assert "(not inlined" in explain(ser)
