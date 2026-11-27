@@ -34,6 +34,7 @@ def explain(serializer: Any) -> str:
     # Mirrors the entry points' checks, including methods assigned on the
     # instance (.data then calls those, not the compiled row).
     usable = compiler.enabled()
+    single_auto = isinstance(serializer, FastOutputMixin) and not serializer.fast_output_single
     if hasattr(serializer, "child"):  # many=True
         if isinstance(serializer, FastListSerializer):
             usable = usable and serializer._fast_output_ok
@@ -55,6 +56,10 @@ def explain(serializer: Any) -> str:
     else:
         usable = usable and compiler.inlineable(serializer)
     if usable:
+        if single_auto:
+            lines.append(
+                "    (single object: DRF; plan below applies in lists or with fast_output_single=True)"
+            )
         walk(serializer, "    ")
     else:
         lines.append("    (not inlined: custom to_representation or opted out)")

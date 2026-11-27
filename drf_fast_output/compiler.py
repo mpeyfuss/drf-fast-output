@@ -14,6 +14,11 @@ The generated function inlines DRF's per-field loop. Each readable field gets:
   - ``call``     ``o.name()`` for a model method source such as
                  ``get_FOO_display`` (DRF re-inspects its signature per row);
   - ``method``   call the bound ``get_<name>`` of a SerializerMethodField;
+  - ``self``     the instance itself, for ``source='*'``;
+  - ``path``     DRF's ``fields.get_attribute(o, source_attrs)`` with its
+                 per-row type checks cached: dotted sources, properties,
+                 annotations, dict keys. A missing attribute or key falls
+                 back to ``get``, so DRF decides default/None/skip/error;
   - ``get``      ``field.get_attribute(o)`` with DRF's SkipField/None handling.
 
 * a *conversion* applied to non-None values, which is either the exact
@@ -36,7 +41,7 @@ import keyword
 import sys
 import threading
 import types
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Mapping
 from contextvars import ContextVar
 from typing import Any, NamedTuple, Protocol
 
@@ -49,7 +54,7 @@ from rest_framework import ISO_8601
 from rest_framework import fields as f
 from rest_framework import relations as r
 from rest_framework import serializers as s
-from rest_framework.fields import SkipField
+from rest_framework.fields import BuiltinSignatureError, SkipField, is_simple_callable
 from rest_framework.relations import PKOnlyObject
 from rest_framework.settings import api_settings
 
@@ -92,7 +97,21 @@ DT_OTHER, DT_UTC, DT_NAIVE = 0, 1, 2
 _UTC_KEYS = frozenset({"UTC", "Etc/UTC"})
 
 
+# The datetime mode of the outermost fast call in progress, shared with the
+# serializers it calls that aren't inlined into it (e.g. a nested serializer
+# with its own to_representation, or every row of a list whose child isn't
+# inlineable). The active timezone is a thread/async-local lookup, too slow to
+# repeat per row.
+active_dtm: ContextVar[int | None] = ContextVar("drf_fast_output_dtm", default=None)
+
+
 def datetime_mode() -> int:
+    """The datetime mode for the active timezone, or of the enclosing fast call."""
+    dtm = active_dtm.get()
+    return _current_datetime_mode() if dtm is None else dtm
+
+
+def _current_datetime_mode() -> int:
     if not dj_settings.USE_TZ:
         return DT_NAIVE
     tz = dj_timezone.get_current_timezone()
@@ -216,7 +235,7 @@ class Plan(NamedTuple):
 
     key: str  # output key (field.field_name)
     field: Any  # the bound DRF field
-    access: str  # attr | fkobj | prefetch | call | method | get
+    access: str  # attr | fkobj | prefetch | call | method | self | path | get
     attr: str | None  # attribute / prefetch cache name for attr, fkobj, prefetch, call
     conv: str  # see _CONV
     needs_dtm: bool = False
@@ -256,12 +275,21 @@ _FIELD_CLASS_DEPS = (
 
 
 def _field_class(t: type) -> _FieldClass:
-    cached = _own(t, _FIELD_CLASS_ATTR)
-    deps = tuple([getattr(t, name, None) for name in _FIELD_CLASS_DEPS])
-    if deps[0] in _PASSTHROUGH_FNS:
+    # Runs for every field of every serializer instance: the reads are spelled
+    # out (one per _FIELD_CLASS_DEPS entry, in order) rather than looped.
+    cached = t.__dict__.get(_FIELD_CLASS_ATTR)
+    to_rep = getattr(t, "to_representation", None)
+    if to_rep in _PASSTHROUGH_FNS:
         # The classification depends on the method behind the passthrough
         # (e.g. ListSerializer.to_representation), so that is what to watch.
-        deps = (_resolve_impl(t, _FIELD_CLASS_DEPS[0], None)[1], *deps[1:])
+        to_rep = _resolve_impl(t, "to_representation", None)[1]
+    deps = (
+        to_rep,
+        getattr(t, "get_attribute", None),
+        getattr(t, "enforce_timezone", None),
+        getattr(t, "default_timezone", None),
+        getattr(t, "use_pk_only_optimization", None),
+    )
     if cached is not None and cached[0] == deps:
         return cached[1]
     info = _classify_field_class(t)
@@ -402,14 +430,19 @@ class _ModelAttr(NamedTuple):
 
 
 def _model_attr(model: type[Model], name: str) -> _ModelAttr:
-    per = _class_memo(model, _MODEL_ATTRS_ATTR)
+    per = model.__dict__.get(_MODEL_ATTRS_ATTR) or _class_memo(model, _MODEL_ATTRS_ATTR)
     # What _describe_model_attr() depends on that can be patched at runtime:
     # serializable_value, and what `name` is on the class. The latter is read
     # from the class dicts like inspect.getattr_static (descriptors such as
     # partialmethod return a new object on every class attribute access), but
     # cheaper, as this runs for every field of every serializer instance.
     sv = model.serializable_value
-    static = next((k.__dict__[name] for k in model.__mro__ if name in k.__dict__), None)
+    static = None
+    for k in model.__mro__:
+        d = k.__dict__
+        if name in d:
+            static = d[name]
+            break
     hit = per.get(name)
     if hit is not None and hit[0] is sv and hit[1] is static:
         return hit[2]
@@ -501,7 +534,11 @@ def _spec(fp: _Fingerprint) -> _Spec:
     if fc.kind == "smf" and fc.get == "plain" and source == "*":
         return _Spec(key, "method", None, "raw")
 
-    get = _Spec(key, "get", None, conv)
+    # Stock Field.get_attribute: resolve the source ourselves, see _get_path().
+    if fc.get == "plain":
+        get = _Spec(key, "self" if source == "*" else "path", None, conv)
+    else:
+        get = _Spec(key, "get", None, conv)
     if ma is None:
         return get
     name = source
@@ -543,6 +580,7 @@ _CONV: dict[str, list[str]] = {
     "choice": [  # DRF returns '' before consulting choice_strings_to_values
         "if _type({v}) is str:",
         "    if {v}: {v} = {F}.choice_strings_to_values.get({v}, {v})",
+        "elif _type({v}) is int: {v} = {F}.choice_strings_to_values.get(_str({v}), {v})",
         "else: {v} = {F}.to_representation({v})",
     ],
     "date": [
@@ -588,9 +626,78 @@ _GLOBALS: dict[str, Any] = {
     "_PKOnly": PKOnlyObject,
     "_SKIP": _SKIP,
     "_ODNE": ObjectDoesNotExist,
+    "_tuple": tuple,
+    "_path": None,  # set below, once _get_path is defined
+    "_PATH_MISS": (KeyError, AttributeError, BuiltinSignatureError),
     "_Manager": BaseManager,
     "_drf": s.Serializer.to_representation,
 }
+
+# --- Attribute paths -----------------------------------------------------------
+#
+# DRF's fields.get_attribute() runs an ``isinstance(x, Mapping)`` ABC check per
+# step and ``inspect.signature()`` for every callable it meets, on every row.
+# Both answers are cached here: per class, and per function (bound or not, as a
+# bound method's signature has no ``self``). Cached on the class / function
+# itself, so they go away with it.
+
+_IS_MAPPING_ATTR = "_fast_output_is_mapping"
+_SIMPLE_ATTRS = ("_fast_output_simple_unbound", "_fast_output_simple_bound")
+
+
+def _is_mapping(cls: type) -> bool:
+    # Builtins cannot hold our class cache; avoid a failed write per dict lookup.
+    if cls is dict:
+        return True
+    # Stored as (cls, answer): a plain class attribute read, which hits the type
+    # attribute cache, and one inherited from a base is recognised as such.
+    hit = getattr(cls, _IS_MAPPING_ATTR, None)
+    if hit is not None and hit[0] is cls:
+        return hit[1]
+    answer = issubclass(cls, Mapping)
+    _store(cls, _IS_MAPPING_ATTR, (cls, answer))  # no-op for builtins such as dict
+    return answer
+
+
+def _is_simple(value: Any) -> bool:
+    """``is_simple_callable(value)``, cached for functions and methods."""
+    cls = type(value)
+    if cls is types.MethodType:
+        fn, slot = value.__func__, 1
+    elif cls is types.FunctionType:
+        fn, slot = value, 0
+    else:  # partials, classes, builtins, callable instances
+        return is_simple_callable(value)
+    attr = _SIMPLE_ATTRS[slot]
+    hit = getattr(fn, attr, None)
+    if hit is None:
+        hit = is_simple_callable(value)
+        setattr(fn, attr, hit)
+    return hit
+
+
+def _get_path(instance: Any, attrs: tuple[str, ...]) -> Any:
+    """``rest_framework.fields.get_attribute``, with its type checks cached."""
+    for attr in attrs:
+        cls = type(instance)
+        hit = getattr(cls, _IS_MAPPING_ATTR, None)  # _is_mapping(), inlined
+        is_mapping = hit[1] if hit is not None and hit[0] is cls else _is_mapping(cls)
+        try:
+            instance = instance[attr] if is_mapping else getattr(instance, attr)
+        except ObjectDoesNotExist:
+            return None
+        if callable(instance) and _is_simple(instance):
+            try:
+                instance = instance()
+            except (AttributeError, KeyError) as exc:
+                raise ValueError(
+                    f'Exception raised in callable attribute "{attr}"; original exception was: {exc}'
+                ) from None
+    return instance
+
+
+_GLOBALS["_path"] = _get_path
+
 
 # Generated code (keyed by shape) and templates (keyed by model and field
 # fingerprints) are shared by every serializer instance that matches. Both are
@@ -650,8 +757,10 @@ def _generate(has_model: bool, shape: tuple[_Spec, ...]) -> str:
         names = []
         if any("{F}" in ln for ln in template):
             names.append(f"F{i} = F[{i}]")
-        if access in ("get", "prefetch", "call"):
+        if access in ("get", "prefetch", "call", "path"):
             names.append(f"G{i} = F[{i}].get_attribute")
+        if access == "path":
+            names.append(f"P{i} = _tuple(F[{i}].source_attrs)")
         if access == "method" or any("{C}" in ln for ln in template):
             names.append(f"C{i} = C[{i}]")
         if names:
@@ -685,6 +794,19 @@ def _generate(has_model: bool, shape: tuple[_Spec, ...]) -> str:
             ]
         elif access == "method":
             row.append(f"{v} = None if o is None else C{i}(o)")
+        elif access == "self":
+            row += [f"{v} = o", *not_null(v, body)]
+        elif access == "path":
+            # A miss (or a builtin callable) re-reads through the field, so DRF
+            # decides between default, None, SkipField and its error message.
+            row += [
+                "try:",
+                f"    {v} = _path(o, P{i})",
+                "except _PATH_MISS:",
+                *_ind(4, drf_get(i, v, body)),
+                "else:",
+                *_ind(4, not_null(v, body)),
+            ]
         elif access == "prefetch":
             # Read per field: an earlier field (e.g. a method calling
             # refresh_from_db()) may have replaced the cache.
